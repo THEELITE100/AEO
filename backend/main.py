@@ -14,6 +14,7 @@ import os
 import time
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip().replace('"', '').replace("'", "")
 
@@ -31,6 +32,7 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
+# Active, confirmed free models on OpenRouter
 ENGINES = [
     {"name": "Llama 3.2 (Meta)", "model_id": "meta-llama/llama-3.2-3b-instruct:free"},
     {"name": "Phi-3 (Microsoft)", "model_id": "microsoft/phi-3-mini-128k-instruct:free"},
@@ -42,15 +44,20 @@ def scrape_product_image(brand: str, query: str) -> str | None:
     try:
         options = Options()
         options.add_argument("--headless=new")
+        
+        # --- CRITICAL DOCKER FLAGS FOR RENDER ---
         options.add_argument("--no-sandbox") 
         options.add_argument("--disable-dev-shm-usage") 
         options.add_argument("--disable-gpu")
         options.binary_location = "/usr/bin/google-chrome-stable"
+        # ----------------------------------------
+
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+
         search_term = urllib.parse.quote(f"{brand} {query} product high quality")
         driver.get(f"https://www.bing.com/images/search?q={search_term}")
 
@@ -74,9 +81,13 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
 
     prompt = f"A user is searching for: '{query}'. Write a concise, 1-paragraph recommendation of the best brands. At the very end of your response, on a new line, explicitly write 'BRANDS MENTIONED:' followed by a comma-separated list of the specific brands you just recommended."
 
+    # --- CRITICAL FIX: OpenRouter Datacenter Headers ---
+    # Without these, OpenRouter blocks free tier requests from cloud servers!
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/THEELITE100/AEO", # Tells them where the request comes from
+        "X-Title": "AEO Diagnostic Engine" # Tells them the name of the app
     }
 
     target_models = [engine["model_id"], "google/gemma-2-9b-it:free"]
@@ -87,22 +98,31 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
             "messages": [{"role": "user", "content": prompt}]
         }
 
-        try:
-            res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15)
+        # --- CRITICAL FIX: Exponential Backoff Retry Loop ---
+        # If we hit a 429, we don't fail immediately. We wait and try again.
+        for attempt in range(3):
+            try:
+                # Increased timeout to 25s for Render's slower network
+                res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=25)
 
-            if res.status_code == 200:
-                data = res.json()
-                if 'choices' in data and len(data['choices']) > 0:
-                    return data['choices'][0]['message']['content'].strip()
-            elif res.status_code == 429:
-                print(f"Rate Limited (429) on {model_to_try}. Taking a breath before retrying...")
-                time.sleep(2)
-                continue
-            else:
-                print(f"Model {model_to_try} unavailable. Status: {res.status_code}")
+                if res.status_code == 200:
+                    data = res.json()
+                    if 'choices' in data and len(data['choices']) > 0:
+                        return data['choices'][0]['message']['content'].strip()
+                
+                elif res.status_code == 429:
+                    wait_time = 2 ** attempt # Wait 1s, then 2s, then 4s
+                    print(f"Rate Limited (429) on {model_to_try}. Attempt {attempt+1}/3. Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue # Try the exact same request again
+                
+                else:
+                    print(f"Model {model_to_try} unavailable. Status: {res.status_code}")
+                    break # Break out of the retry loop, try the fallback model
 
-        except Exception as e:
-            print(f"Request Error ({model_to_try}): {e}")
+            except Exception as e:
+                print(f"Request Error ({model_to_try}): {e}")
+                time.sleep(1)
 
     return None
 
@@ -147,16 +167,20 @@ def process_engine_logic(query: str, brand: str, engine: dict):
 
 @app.post("/api/diagnose")
 async def run_diagnostic(request: DiagnosticRequest):
+    # 1. Start the image scrape
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
+    # 2. SEQUENTIAL PROCESSING (Prevents OpenRouter 429 Errors)
     engine_results = []
     for engine in ENGINES:
         res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
         engine_results.append(res)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2) # Increased pause slightly to ensure API limits are respected
 
+    # Wait for image
     image_url = await image_task
 
+    # 3. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
     total_successful = len(successful_engines)
 
