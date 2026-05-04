@@ -8,12 +8,14 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 import urllib.parse
+import requests
 import asyncio
 import os
+import time
 from dotenv import load_dotenv
-import g4f
 
 load_dotenv()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip().replace('"', '').replace("'", "")
 
 app = FastAPI(title="AEO Multi-Engine API")
 
@@ -29,28 +31,29 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
-# g4f dynamically routes to these models
 ENGINES = [
-    {"name": "GPT-4o (OpenAI)", "model_id": "gpt-4o"},
-    {"name": "Llama 3.1 (Meta)", "model_id": "llama-3.1-70b"},
-    {"name": "Claude 3.5 (Anthropic)", "model_id": "claude-3.5-sonnet"}
+    {"name": "Llama 3.2 (Meta)", "model_id": "meta-llama/llama-3.2-3b-instruct:free"},
+    {"name": "Phi-3 (Microsoft)", "model_id": "microsoft/phi-3-mini-128k-instruct:free"},
+    {"name": "Mistral (Mistral AI)", "model_id": "mistralai/mistral-7b-instruct:free"}
 ]
 
 def scrape_product_image(brand: str, query: str) -> str | None:
     driver = None
     try:
         options = Options()
-        options.add_argument("--headless=new")        
+        options.add_argument("--headless=new")
         options.add_argument("--no-sandbox") 
         options.add_argument("--disable-dev-shm-usage") 
         options.add_argument("--disable-gpu")
         options.binary_location = "/usr/bin/google-chrome-stable"
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
         search_term = urllib.parse.quote(f"{brand} {query} product high quality")
         driver.get(f"https://www.bing.com/images/search?q={search_term}")
+
         WebDriverWait(driver, 10).until(lambda d: len(d.find_elements(By.CLASS_NAME, "mimg")) > 0)
 
         for img in driver.find_elements(By.CLASS_NAME, "mimg"):
@@ -64,33 +67,42 @@ def scrape_product_image(brand: str, query: str) -> str | None:
     finally:
         if driver:
             driver.quit()
-            driver.quit()
 
 def fetch_real_ai_data(query: str, engine: dict) -> str | None:
+    if not OPENROUTER_API_KEY:
+        return "⚠️ SETUP REQUIRED: Please add your OpenRouter API key to the Render Environment Variables."
+
     prompt = f"A user is searching for: '{query}'. Write a concise, 1-paragraph recommendation of the best brands. At the very end of your response, on a new line, explicitly write 'BRANDS MENTIONED:' followed by a comma-separated list of the specific brands you just recommended."
 
-    try:
-        # g4f request - finds a working provider
-        response = g4f.ChatCompletion.create(
-            model=engine["model_id"],
-            messages=[{"role": "user", "content": prompt}]
-        )
-        if response and isinstance(response, str):
-            return response.strip()
-            
-    except Exception as e:
-        print(f"g4f Error ({engine['model_id']}): {e}")
-        
-        # fallback to generic GPT-4 model
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    target_models = [engine["model_id"], "google/gemma-2-9b-it:free"]
+    
+    for model_to_try in target_models:
+        payload = {
+            "model": model_to_try,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+
         try:
-            fallback_response = g4f.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            if fallback_response and isinstance(fallback_response, str):
-                return fallback_response.strip()
-        except Exception:
-            pass
+            res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15)
+
+            if res.status_code == 200:
+                data = res.json()
+                if 'choices' in data and len(data['choices']) > 0:
+                    return data['choices'][0]['message']['content'].strip()
+            elif res.status_code == 429:
+                print(f"Rate Limited (429) on {model_to_try}. Taking a breath before retrying...")
+                time.sleep(2)
+                continue
+            else:
+                print(f"Model {model_to_try} unavailable. Status: {res.status_code}")
+
+        except Exception as e:
+            print(f"Request Error ({model_to_try}): {e}")
 
     return None
 
@@ -102,9 +114,17 @@ def process_engine_logic(query: str, brand: str, engine: dict):
             "engine_name": engine["name"],
             "is_mentioned": False,
             "competitors": "Failed to load",
-            "answer": "⚠️ REAL DATA UNAVAILABLE. The providers are temporarily busy."
+            "answer": "⚠️ REAL DATA UNAVAILABLE. The API request timed out or was rate-limited."
         }
     
+    if "SETUP REQUIRED" in raw_answer:
+         return {
+            "engine_name": engine["name"],
+            "is_mentioned": False,
+            "competitors": "Pending Key",
+            "answer": raw_answer
+        }
+
     is_mentioned = brand.lower() in raw_answer.lower()
     competitors = "None found"
     clean_answer = raw_answer
@@ -112,12 +132,9 @@ def process_engine_logic(query: str, brand: str, engine: dict):
     if "BRANDS MENTIONED:" in raw_answer.upper():
         parts = raw_answer.upper().split("BRANDS MENTIONED:")
         comps_string = parts[-1].replace(".", "").replace("*", "").strip()
-
         clean_answer = raw_answer[:raw_answer.upper().rfind("BRANDS MENTIONED:")].strip()
-
         comp_list = [c.strip().title() for c in comps_string.split(",") if len(c.strip()) > 1]
         comp_list = [c for c in comp_list if brand.lower() not in c.lower()]
-
         if comp_list:
             competitors = ", ".join(comp_list)
 
@@ -132,17 +149,15 @@ def process_engine_logic(query: str, brand: str, engine: dict):
 async def run_diagnostic(request: DiagnosticRequest):
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    engine_tasks = [
-        asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
-        for engine in ENGINES
-    ]
+    engine_results = []
+    for engine in ENGINES:
+        res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
+        engine_results.append(res)
+        await asyncio.sleep(1.5)
 
-    results = await asyncio.gather(image_task, *engine_tasks)
+    image_url = await image_task
 
-    image_url = results[0]
-    engine_results = list(results[1:])
-
-    successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"]]
+    successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
     total_successful = len(successful_engines)
 
     score = sum(1 for r in successful_engines if r["is_mentioned"])
@@ -150,7 +165,7 @@ async def run_diagnostic(request: DiagnosticRequest):
 
     all_competitors = set()
     for r in successful_engines:
-        if r["competitors"] not in ["Failed to load", "None found"]:
+        if r["competitors"] not in ["Failed to load", "None found", "Pending Key"]:
             comps = [c.strip() for c in r["competitors"].split(",")]
             all_competitors.update(comps)
 
