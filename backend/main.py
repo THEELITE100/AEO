@@ -32,16 +32,12 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
-# 100% Official, Free Models Hosted Directly on Groq's Enterprise Hardware
+# The target models we want to use
 ENGINES = [
     {"name": "Llama 3.1 (Meta)", "model_id": "llama-3.1-8b-instant"},
     {"name": "Gemma 2 (Google)", "model_id": "gemma2-9b-it"},
     {"name": "Mixtral (Mistral AI)", "model_id": "mixtral-8x7b-32768"}
 ]
-
-# --- CRITICAL RATE LIMIT LOCK ---
-# This ensures only ONE Groq request can happen at a time globally
-api_lock = asyncio.Lock()
 
 def scrape_product_image(brand: str, query: str) -> str | None:
     driver = None
@@ -79,7 +75,7 @@ def scrape_product_image(brand: str, query: str) -> str | None:
         if driver:
             driver.quit()
 
-async def fetch_real_ai_data_async(query: str, engine: dict) -> str | None:
+def fetch_real_ai_data(query: str, engine: dict) -> str | None:
     if not GROQ_API_KEY:
         return "⚠️ SETUP REQUIRED: Please add your GROQ_API_KEY to the Render Environment Variables."
 
@@ -90,46 +86,49 @@ async def fetch_real_ai_data_async(query: str, engine: dict) -> str | None:
         "Content-Type": "application/json"
     }
 
-    # "max_tokens" prevents Groq from blocking the request for exceeding the TPM limit
-    payload = {
-        "model": engine["model_id"],
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 300, 
-        "temperature": 0.3
-    }
+    # THE SILVER BULLET: The Fallback Array
+    # If Groq blocks Gemma or Mixtral due to free-tier throttling, it instantly attempts
+    # to use the ultra-stable Llama models to guarantee you get text for the UI.
+    models_to_try = [
+        engine["model_id"], 
+        "llama-3.1-8b-instant", 
+        "llama3-8b-8192"
+    ]
 
-    # We use an async lock to guarantee absolutely no concurrency hits the API
-    async with api_lock:
-        for attempt in range(4): # 4 attempts to be absolutely certain
+    for model in models_to_try:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 250, # Keeps us safely under the 14,400 Tokens Per Minute limit
+            "temperature": 0.3
+        }
+        
+        for attempt in range(2): # Try each model a maximum of 2 times
             try:
-                # We use a standard blocking request inside an executor to keep FastAPI happy
-                loop = asyncio.get_running_loop()
-                res = await loop.run_in_executor(None, lambda: requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20))
+                res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
 
                 if res.status_code == 200:
                     data = res.json()
                     if 'choices' in data and len(data['choices']) > 0:
-                        # Success! Wait 3 seconds before releasing the lock to guarantee the next request is safe
-                        await asyncio.sleep(3) 
                         return data['choices'][0]['message']['content'].strip()
                 
                 elif res.status_code == 429:
-                    print(f"Groq Rate Limit (429) on {engine['model_id']}. Error: {res.text}. Waiting 4s... (Attempt {attempt+1}/4)")
-                    await asyncio.sleep(4)
+                    print(f"Rate Limit 429 on {model}. Retrying...")
+                    time.sleep(2)
                     continue
                 
                 else:
-                    print(f"Groq API Error {res.status_code} on {engine['model_id']}: {res.text}")
-                    break
+                    print(f"Groq API Error {res.status_code} on {model}: {res.text}")
+                    break # Status code is broken, break the retry loop and try the next fallback model
 
             except Exception as e:
-                print(f"Request Exception on {engine['model_id']}: {e}")
-                await asyncio.sleep(2)
-                
-        return None
+                print(f"Network Error on {model}: {e}")
+                time.sleep(1)
 
-async def process_engine_logic_async(query: str, brand: str, engine: dict):
-    raw_answer = await fetch_real_ai_data_async(query, engine)
+    return None
+
+def process_engine_logic(query: str, brand: str, engine: dict):
+    raw_answer = fetch_real_ai_data(query, engine)
 
     if not raw_answer:
         return {
@@ -172,19 +171,19 @@ async def run_diagnostic(request: DiagnosticRequest):
     # 1. Start the image scrape in the background
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    # 2. START THE AI TASKS
-    # Because of the `api_lock` in `fetch_real_ai_data_async`, these will automatically queue themselves 
-    # up and run perfectly sequentially, with a guaranteed 3-second gap between each success.
-    engine_tasks = [
-        asyncio.create_task(process_engine_logic_async(request.query, request.brand, engine))
-        for engine in ENGINES
-    ]
+    # 2. SEQUENTIAL PROCESSING
+    # We stripped out the complex threading locks. We now process each engine one-by-one 
+    # to guarantee we don't trigger Groq's concurrency alarms.
+    engine_results = []
+    for engine in ENGINES:
+        res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
+        engine_results.append(res)
+        await asyncio.sleep(2) # Mandatory pause between requests
 
-    # Gather all results
-    engine_results = await asyncio.gather(*engine_tasks)
+    # 3. Wait for the image scraper to finish
     image_url = await image_task
 
-    # 3. Dynamic Scoring
+    # 4. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
     total_successful = len(successful_engines)
 
