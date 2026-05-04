@@ -14,7 +14,6 @@ import os
 import time
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip().replace('"', '').replace("'", "")
 
@@ -32,7 +31,6 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
-# 100% Official, Free Models Hosted Directly on Groq's Enterprise Hardware
 ENGINES = [
     {"name": "Llama 3.1 (Meta)", "model_id": "llama-3.1-8b-instant"},
     {"name": "Gemma 2 (Google)", "model_id": "gemma2-9b-it"},
@@ -43,15 +41,11 @@ def scrape_product_image(brand: str, query: str) -> str | None:
     driver = None
     try:
         options = Options()
-        options.add_argument("--headless=new")
-        
-        # --- CRITICAL DOCKER FLAGS FOR RENDER ---
+        options.add_argument("--headless=new")        
         options.add_argument("--no-sandbox") 
         options.add_argument("--disable-dev-shm-usage") 
         options.add_argument("--disable-gpu")
         options.binary_location = "/usr/bin/google-chrome-stable"
-        # ----------------------------------------
-
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
@@ -88,31 +82,34 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
 
     payload = {
         "model": engine["model_id"],
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300, 
+        "temperature": 0.3
     }
 
-    try:
-        res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
+    for attempt in range(3):
+        try:
+            res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=15)
 
-        if res.status_code == 200:
-            data = res.json()
-            if 'choices' in data and len(data['choices']) > 0:
-                return data['choices'][0]['message']['content'].strip()
-        elif res.status_code == 429:
-            print(f"Groq Rate Limit (429) on {engine['model_id']}. Waiting 2s before retry...")
+            if res.status_code == 200:
+                data = res.json()
+                if 'choices' in data and len(data['choices']) > 0:
+                    return data['choices'][0]['message']['content'].strip()
+            
+            elif res.status_code == 429:
+                print(f"Groq TPM Limit Hit on {engine['model_id']}. Waiting 3s... (Attempt {attempt+1}/3)")
+                time.sleep(3)
+                continue
+            
+            else:
+                print(f"Groq API Error {res.status_code}: {res.text}")
+                break
+
+        except Exception as e:
+            print(f"Request Error ({engine['model_id']}): {e}")
             time.sleep(2)
-            # One simple retry for rate limits
-            res_retry = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
-            if res_retry.status_code == 200:
-                 return res_retry.json()['choices'][0]['message']['content'].strip()
-            return None
-        else:
-            print(f"Groq API Error {res.status_code}: {res.text}")
-            return None
 
-    except Exception as e:
-        print(f"Request Error ({engine['model_id']}): {e}")
-        return None
+    return None
 
 def process_engine_logic(query: str, brand: str, engine: dict):
     raw_answer = fetch_real_ai_data(query, engine)
@@ -155,21 +152,16 @@ def process_engine_logic(query: str, brand: str, engine: dict):
 
 @app.post("/api/diagnose")
 async def run_diagnostic(request: DiagnosticRequest):
-    # 1. Start the image scrape in the background
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    # 2. SEQUENTIAL PROCESSING FOR GROQ
-    # We ask one model, wait 1.5 seconds, then ask the next to bypass the concurrency rate limit.
     engine_results = []
     for engine in ENGINES:
         res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
         engine_results.append(res)
-        await asyncio.sleep(1.5) # The golden pause that fixes the 429 errors
+        await asyncio.sleep(2.5) 
 
-    # Wait for the image scraper to finish
     image_url = await image_task
 
-    # 3. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
     total_successful = len(successful_engines)
 
