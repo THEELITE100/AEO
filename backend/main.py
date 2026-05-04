@@ -11,6 +11,7 @@ import urllib.parse
 import requests
 import asyncio
 import os
+import time
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -80,7 +81,6 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
 
     prompt = f"A user is searching for: '{query}'. Write a concise, 1-paragraph recommendation of the best brands. At the very end of your response, on a new line, explicitly write 'BRANDS MENTIONED:' followed by a comma-separated list of the specific brands you just recommended."
 
-    # Groq uses the exact same API format as OpenAI, making integration flawless
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -92,13 +92,20 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
     }
 
     try:
-        # Groq is insanely fast, so we don't need massive timeout windows
         res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
 
         if res.status_code == 200:
             data = res.json()
             if 'choices' in data and len(data['choices']) > 0:
                 return data['choices'][0]['message']['content'].strip()
+        elif res.status_code == 429:
+            print(f"Groq Rate Limit (429) on {engine['model_id']}. Waiting 2s before retry...")
+            time.sleep(2)
+            # One simple retry for rate limits
+            res_retry = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
+            if res_retry.status_code == 200:
+                 return res_retry.json()['choices'][0]['message']['content'].strip()
+            return None
         else:
             print(f"Groq API Error {res.status_code}: {res.text}")
             return None
@@ -148,21 +155,19 @@ def process_engine_logic(query: str, brand: str, engine: dict):
 
 @app.post("/api/diagnose")
 async def run_diagnostic(request: DiagnosticRequest):
-    # 1. Start the image scrape
+    # 1. Start the image scrape in the background
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    # 2. FIRE ALL ENGINES CONCURRENTLY! 
-    # Because Groq welcomes developers, we don't need to wait or throttle requests.
-    engine_tasks = [
-        asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
-        for engine in ENGINES
-    ]
+    # 2. SEQUENTIAL PROCESSING FOR GROQ
+    # We ask one model, wait 1.5 seconds, then ask the next to bypass the concurrency rate limit.
+    engine_results = []
+    for engine in ENGINES:
+        res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
+        engine_results.append(res)
+        await asyncio.sleep(1.5) # The golden pause that fixes the 429 errors
 
-    # Gather all results instantly
-    results = await asyncio.gather(image_task, *engine_tasks)
-
-    image_url = results[0]
-    engine_results = list(results[1:])
+    # Wait for the image scraper to finish
+    image_url = await image_task
 
     # 3. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
