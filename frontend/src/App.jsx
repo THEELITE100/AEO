@@ -66,7 +66,7 @@ export default function App() {
             Multi Engine AEO
           </h1>
           <p className="text-slate-600 dark:text-slate-400 font-medium mt-3">
-            Compare brand visibility across multiple models.
+            Compare brand visibility across multiple models
           </p>
         </div>
 
