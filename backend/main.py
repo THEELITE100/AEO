@@ -14,7 +14,6 @@ import os
 import time
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip().replace('"', '').replace("'", "")
 
@@ -32,11 +31,10 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
-# The target models we want to use
 ENGINES = [
-    {"name": "Llama 3.1 (Meta)", "model_id": "llama-3.1-8b-instant"},
-    {"name": "Gemma 2 (Google)", "model_id": "gemma2-9b-it"},
-    {"name": "Mixtral (Mistral AI)", "model_id": "mixtral-8x7b-32768"}
+    {"name": "Llama 3.1 ", "model_id": "llama-3.1-8b-instant"},
+    {"name": "Gemma 2 ", "model_id": "gemma2-9b-it"},
+    {"name": "Mixtral ", "model_id": "mixtral-8x7b-32768"}
 ]
 
 def scrape_product_image(brand: str, query: str) -> str | None:
@@ -44,14 +42,10 @@ def scrape_product_image(brand: str, query: str) -> str | None:
     try:
         options = Options()
         options.add_argument("--headless=new")
-        
-        # --- CRITICAL DOCKER FLAGS FOR RENDER ---
         options.add_argument("--no-sandbox") 
         options.add_argument("--disable-dev-shm-usage") 
         options.add_argument("--disable-gpu")
         options.binary_location = "/usr/bin/google-chrome-stable"
-        # ----------------------------------------
-
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
@@ -86,9 +80,6 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
         "Content-Type": "application/json"
     }
 
-    # THE SILVER BULLET: The Fallback Array
-    # If Groq blocks Gemma or Mixtral due to free-tier throttling, it instantly attempts
-    # to use the ultra-stable Llama models to guarantee you get text for the UI.
     models_to_try = [
         engine["model_id"], 
         "llama-3.1-8b-instant", 
@@ -99,28 +90,24 @@ def fetch_real_ai_data(query: str, engine: dict) -> str | None:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 250, # Keeps us safely under the 14,400 Tokens Per Minute limit
+            "max_tokens": 250, 
             "temperature": 0.3
         }
         
-        for attempt in range(2): # Try each model a maximum of 2 times
+        for attempt in range(2): 
             try:
                 res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
-
                 if res.status_code == 200:
                     data = res.json()
                     if 'choices' in data and len(data['choices']) > 0:
                         return data['choices'][0]['message']['content'].strip()
-                
                 elif res.status_code == 429:
                     print(f"Rate Limit 429 on {model}. Retrying...")
                     time.sleep(2)
                     continue
-                
                 else:
                     print(f"Groq API Error {res.status_code} on {model}: {res.text}")
-                    break # Status code is broken, break the retry loop and try the next fallback model
-
+                    break 
             except Exception as e:
                 print(f"Network Error on {model}: {e}")
                 time.sleep(1)
@@ -168,22 +155,16 @@ def process_engine_logic(query: str, brand: str, engine: dict):
 
 @app.post("/api/diagnose")
 async def run_diagnostic(request: DiagnosticRequest):
-    # 1. Start the image scrape in the background
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    # 2. SEQUENTIAL PROCESSING
-    # We stripped out the complex threading locks. We now process each engine one-by-one 
-    # to guarantee we don't trigger Groq's concurrency alarms.
     engine_results = []
     for engine in ENGINES:
         res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
         engine_results.append(res)
-        await asyncio.sleep(2) # Mandatory pause between requests
+        await asyncio.sleep(2)
 
-    # 3. Wait for the image scraper to finish
     image_url = await image_task
 
-    # 4. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
     total_successful = len(successful_engines)
 
