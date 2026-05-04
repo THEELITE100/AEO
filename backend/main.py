@@ -11,12 +11,11 @@ import urllib.parse
 import requests
 import asyncio
 import os
-import time
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip().replace('"', '').replace("'", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip().replace('"', '').replace("'", "")
 
 app = FastAPI(title="AEO Multi-Engine API")
 
@@ -32,11 +31,11 @@ class DiagnosticRequest(BaseModel):
     query: str
     brand: str
 
-# Active, confirmed free models on OpenRouter
+# 100% Official, Free Models Hosted Directly on Groq's Enterprise Hardware
 ENGINES = [
-    {"name": "Llama 3.2 (Meta)", "model_id": "meta-llama/llama-3.2-3b-instruct:free"},
-    {"name": "Phi-3 (Microsoft)", "model_id": "microsoft/phi-3-mini-128k-instruct:free"},
-    {"name": "Mistral (Mistral AI)", "model_id": "mistralai/mistral-7b-instruct:free"}
+    {"name": "Llama 3.1 (Meta)", "model_id": "llama-3.1-8b-instant"},
+    {"name": "Gemma 2 (Google)", "model_id": "gemma2-9b-it"},
+    {"name": "Mixtral (Mistral AI)", "model_id": "mixtral-8x7b-32768"}
 ]
 
 def scrape_product_image(brand: str, query: str) -> str | None:
@@ -76,55 +75,37 @@ def scrape_product_image(brand: str, query: str) -> str | None:
             driver.quit()
 
 def fetch_real_ai_data(query: str, engine: dict) -> str | None:
-    if not OPENROUTER_API_KEY:
-        return "⚠️ SETUP REQUIRED: Please add your OpenRouter API key to the Render Environment Variables."
+    if not GROQ_API_KEY:
+        return "⚠️ SETUP REQUIRED: Please add your GROQ_API_KEY to the Render Environment Variables."
 
     prompt = f"A user is searching for: '{query}'. Write a concise, 1-paragraph recommendation of the best brands. At the very end of your response, on a new line, explicitly write 'BRANDS MENTIONED:' followed by a comma-separated list of the specific brands you just recommended."
 
-    # --- CRITICAL FIX: OpenRouter Datacenter Headers ---
-    # Without these, OpenRouter blocks free tier requests from cloud servers!
+    # Groq uses the exact same API format as OpenAI, making integration flawless
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/THEELITE100/AEO", # Tells them where the request comes from
-        "X-Title": "AEO Diagnostic Engine" # Tells them the name of the app
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
 
-    target_models = [engine["model_id"], "google/gemma-2-9b-it:free"]
-    
-    for model_to_try in target_models:
-        payload = {
-            "model": model_to_try,
-            "messages": [{"role": "user", "content": prompt}]
-        }
+    payload = {
+        "model": engine["model_id"],
+        "messages": [{"role": "user", "content": prompt}]
+    }
 
-        # --- CRITICAL FIX: Exponential Backoff Retry Loop ---
-        # If we hit a 429, we don't fail immediately. We wait and try again.
-        for attempt in range(3):
-            try:
-                # Increased timeout to 25s for Render's slower network
-                res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=25)
+    try:
+        # Groq is insanely fast, so we don't need massive timeout windows
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
 
-                if res.status_code == 200:
-                    data = res.json()
-                    if 'choices' in data and len(data['choices']) > 0:
-                        return data['choices'][0]['message']['content'].strip()
-                
-                elif res.status_code == 429:
-                    wait_time = 2 ** attempt # Wait 1s, then 2s, then 4s
-                    print(f"Rate Limited (429) on {model_to_try}. Attempt {attempt+1}/3. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue # Try the exact same request again
-                
-                else:
-                    print(f"Model {model_to_try} unavailable. Status: {res.status_code}")
-                    break # Break out of the retry loop, try the fallback model
+        if res.status_code == 200:
+            data = res.json()
+            if 'choices' in data and len(data['choices']) > 0:
+                return data['choices'][0]['message']['content'].strip()
+        else:
+            print(f"Groq API Error {res.status_code}: {res.text}")
+            return None
 
-            except Exception as e:
-                print(f"Request Error ({model_to_try}): {e}")
-                time.sleep(1)
-
-    return None
+    except Exception as e:
+        print(f"Request Error ({engine['model_id']}): {e}")
+        return None
 
 def process_engine_logic(query: str, brand: str, engine: dict):
     raw_answer = fetch_real_ai_data(query, engine)
@@ -170,15 +151,18 @@ async def run_diagnostic(request: DiagnosticRequest):
     # 1. Start the image scrape
     image_task = asyncio.to_thread(scrape_product_image, request.brand, request.query)
 
-    # 2. SEQUENTIAL PROCESSING (Prevents OpenRouter 429 Errors)
-    engine_results = []
-    for engine in ENGINES:
-        res = await asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
-        engine_results.append(res)
-        await asyncio.sleep(2) # Increased pause slightly to ensure API limits are respected
+    # 2. FIRE ALL ENGINES CONCURRENTLY! 
+    # Because Groq welcomes developers, we don't need to wait or throttle requests.
+    engine_tasks = [
+        asyncio.to_thread(process_engine_logic, request.query, request.brand, engine)
+        for engine in ENGINES
+    ]
 
-    # Wait for image
-    image_url = await image_task
+    # Gather all results instantly
+    results = await asyncio.gather(image_task, *engine_tasks)
+
+    image_url = results[0]
+    engine_results = list(results[1:])
 
     # 3. Dynamic Scoring
     successful_engines = [r for r in engine_results if "REAL DATA UNAVAILABLE" not in r["answer"] and "SETUP REQUIRED" not in r["answer"]]
