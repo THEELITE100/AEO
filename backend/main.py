@@ -40,15 +40,17 @@ def scrape_product_image(brand: str, query: str) -> str | None:
     driver = None
     try:
         options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        options.add_argument("--headless=new")        
+        options.add_argument("--no-sandbox") 
+        options.add_argument("--disable-dev-shm-usage") 
+        options.add_argument("--disable-gpu")
+        options.binary_location = "/usr/bin/google-chrome-stable"
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-
         search_term = urllib.parse.quote(f"{brand} {query} product high quality")
         driver.get(f"https://www.bing.com/images/search?q={search_term}")
-
         WebDriverWait(driver, 10).until(lambda d: len(d.find_elements(By.CLASS_NAME, "mimg")) > 0)
 
         for img in driver.find_elements(By.CLASS_NAME, "mimg"):
@@ -56,10 +58,12 @@ def scrape_product_image(brand: str, query: str) -> str | None:
             if src and src.startswith("http"):
                 return src
         return None
-    except Exception:
+    except Exception as e:
+        print(f"Image Scrape Error: {e}")
         return None
     finally:
         if driver:
+            driver.quit()
             driver.quit()
 
 def fetch_real_ai_data(query: str, engine: dict) -> str | None:
