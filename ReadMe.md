@@ -54,3 +54,5 @@ In your frontend terminal, run:
 *(The frontend will run on http://localhost:5173)*
 
 Open your browser to `http://localhost:5173`, enter a customer search query (e.g., "Best noise canceling headphones") and your target brand (e.g., "Sony"), and run your global AEO Audit!
+
+**Live Website:** https://aeo-dun.vercel.app/
